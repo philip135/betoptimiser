@@ -19,9 +19,12 @@ Modules
 
 from betoptimiser.models import BetOption, ArbResult
 from betoptimiser.solver import solve_arb
+from betoptimiser.execution import execute_arb, ExecutionReport
 
 __all__ = [
     "BetOption",
     "ArbResult",
     "solve_arb",
+    "execute_arb",
+    "ExecutionReport",
 ]

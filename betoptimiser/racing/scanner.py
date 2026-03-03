@@ -1,11 +1,27 @@
 """
-Racing Scanner – per‑race and batch arb scanning.
+Racing Scanner – per-runner cross-market arb detection via convex optimisation.
+
+Instead of enumerating all ordered finish permutations (O(N!)), analyses each
+runner independently across WIN, PLACE, EACH_WAY, and OTHER_PLACE markets.
+
+For each runner, the possible finishing outcomes are a small set of states
+(typically 3–5: wins, places-only, doesn't place).  This is the convex hull
+of outcomes — we solve a tiny LP over these states in microseconds.
+
+Example: WIN + PLACE(3) + EACH_WAY(1/4, 3pl) gives 3 states per runner:
+  1. Wins (1st)
+  2. Places (2nd–3rd)
+  3. Doesn't place (>3rd)
+
+The LP finds stakes across all available bets (back/lay on each market) that
+guarantee positive profit in every state.  If it succeeds → cross-market arb.
+
+Total work: N_runners × 3-state LP  (~200 runners → < 100ms total)
 """
 
 from __future__ import annotations
 
 import logging
-from math import perm
 from typing import Optional
 
 import numpy as np
@@ -13,116 +29,201 @@ import numpy as np
 from betoptimiser.models import ArbResult, BetOption
 from betoptimiser.solver import solve_arb
 from betoptimiser.prices import extract_bet_options
-from betoptimiser.racing.scenarios import runner_names, build_scenarios
-from betoptimiser.racing.payouts import build_payout_matrix
 from betoptimiser.racing.detection import (
     detect_place_count,
     detect_ew_terms,
     classify_market_type,
 )
 from betfairtools.constants import (
-    WIN, PLACE, EACH_WAY, FORECAST, REVERSE_FORECAST,
-    REV_FORECAST, OTHER_PLACE, MATCH_BET, WITHOUT_FAV,
-    ALL_RACING_TYPES,
+    WIN, PLACE, EACH_WAY,
+    OTHER_PLACE,
 )
 
 logger = logging.getLogger(__name__)
 
+# Market types where outcome depends only on THIS runner's finishing position.
+SINGLE_RUNNER_TYPES = {WIN, PLACE, EACH_WAY, OTHER_PLACE}
 
-def scan_arb(
-    session,
-    race_catalogues: list,
+# Only fetch these market types (skip FORECAST, MATCH_BET, etc.)
+SCAN_MARKET_TYPES = [WIN, PLACE, EACH_WAY, OTHER_PLACE]
+
+
+# ── Per-runner payout logic ───────────────────────────────────────────────────
+
+def _bet_payout_at_position(bet: BetOption, position: int) -> float:
+    """
+    Net profit per £1 unit stake if the runner finishes at ``position``.
+
+    position = 1 → wins.  position > K → doesn't place for a K-place market.
+
+    Market types:
+      WIN:            hit if position == 1
+      PLACE(K):       hit if position ≤ K
+      OTHER_PLACE(K): hit if position ≤ K
+      EACH_WAY(f,K):  3-tier: win (pos=1), place-only (1<pos≤K), lose (pos>K)
+                       Note: £1 unit EW = £1 win-part + £1 place-part = £2 total
+    """
+    mt = bet.market_type
+    side = bet.side
+    p = bet.price
+
+    if mt == WIN:
+        hit = position == 1
+        return (p - 1.0 if hit else -1.0) if side == "BACK" else (-(p - 1.0) if hit else 1.0)
+
+    if mt in (PLACE, OTHER_PLACE):
+        hit = position <= bet.place_count
+        return (p - 1.0 if hit else -1.0) if side == "BACK" else (-(p - 1.0) if hit else 1.0)
+
+    if mt == EACH_WAY:
+        f = bet.ew_fraction
+        wins = position == 1
+        places = position <= bet.ew_places
+
+        if side == "BACK":
+            if wins:
+                return (p - 1.0) * (1.0 + f)      # both parts win
+            elif places:
+                return (p - 1.0) * f - 1.0          # place part wins, win part loses
+            else:
+                return -2.0                          # both parts lose
+        else:  # LAY
+            if wins:
+                return -(p - 1.0) * (1.0 + f)
+            elif places:
+                return 1.0 - (p - 1.0) * f
+            else:
+                return 2.0
+
+    # Unknown type — treat as WIN
+    hit = position == 1
+    return (p - 1.0 if hit else -1.0) if side == "BACK" else (-(p - 1.0) if hit else 1.0)
+
+
+def _runner_outcome_states(
+    bets: list[BetOption],
+) -> list[tuple[int, str]]:
+    """
+    Determine the distinct finishing-position states for a runner.
+
+    Each market defines a "cut point" — a position threshold that changes
+    the payout.  All positions within a band (between consecutive cut points)
+    produce identical payouts for every bet, so we only need one representative
+    per band.
+
+    Returns list of (representative_position, human_label) pairs.
+
+    Example – WIN + PLACE(3) + EW(3pl):
+      Cut points: {1, 3}
+      States: [(1, "Wins"), (3, "Places 2nd-3rd"), (4, "Doesn't place")]
+
+    Example – WIN + PLACE(3) + OTHER_PLACE(2):
+      Cut points: {1, 2, 3}
+      States: [(1, "Wins"), (2, "Finishes 2nd"), (3, "Finishes 3rd"), (4, "Doesn't place")]
+    """
+    cut_points = {1}  # WIN always distinguishes 1st vs rest
+    for b in bets:
+        if b.market_type in (PLACE, OTHER_PLACE) and b.place_count > 0:
+            cut_points.add(b.place_count)
+        if b.market_type == EACH_WAY and b.ew_places > 0:
+            cut_points.add(b.ew_places)
+
+    sorted_cuts = sorted(cut_points)
+    ordinal = lambda n: {1: "1st", 2: "2nd", 3: "3rd"}.get(n, f"{n}th")
+
+    states: list[tuple[int, str]] = []
+    prev = 0
+    for c in sorted_cuts:
+        lo, hi = prev + 1, c
+        if lo == 1 and hi == 1:
+            label = "Wins"
+        elif lo == hi:
+            label = f"Finishes {ordinal(lo)}"
+        else:
+            label = f"Places {ordinal(lo)}-{ordinal(hi)}"
+        states.append((c, label))
+        prev = c
+
+    max_place = sorted_cuts[-1]
+    states.append((max_place + 1, "Doesn't place"))
+    return states
+
+
+def _build_runner_payout_matrix(
+    bets: list[BetOption],
+    positions: list[int],
+) -> np.ndarray:
+    """
+    Build the (n_states × n_bets) payout matrix for one runner.
+    Typically 3 rows × 4-8 columns — trivially small.
+    """
+    A = np.zeros((len(positions), len(bets)))
+    for i, pos in enumerate(positions):
+        for j, bet in enumerate(bets):
+            A[i, j] = _bet_payout_at_position(bet, pos)
+    return A
+
+
+# ── Per-runner arb scan ───────────────────────────────────────────────────────
+
+def scan_runner_arb(
+    runner_name: str,
+    runner_bets: list[BetOption],
     budget: float = 100.0,
     commission: float = 0.02,
-    market_meta: Optional[dict[str, dict]] = None,
     race_name: str = "",
-    n_runners: int = 0,
-    pre_fetched_books: Optional[dict] = None,
-    rank_non_arbs: bool = False,
 ) -> ArbResult:
     """
-    End‑to‑end arb scan for a single horse race across ALL available
-    market types.
+    Check a single runner for a cross-market arb.
+
+    Builds a tiny payout matrix over the runner's possible finishing
+    positions (3–5 states) and solves the LP in microseconds.
 
     Parameters
     ----------
-    session : betfairtools.Session
-        Authenticated session.
-    race_catalogues : list[MarketCatalogue]
-        All market catalogues for this race (matched by event_id + start_time).
-    budget : float
-    commission : float
-    market_meta : dict[market_id, dict] | None
-        Per-market metadata (market_type, place_count, ew_fraction, ew_places).
+    runner_name : str
+    runner_bets : list[BetOption]
+        All bets for this runner across all markets.
+    budget, commission : float
     race_name : str
-    n_runners : int
-    pre_fetched_books : dict[market_id, MarketBook] | None
-        Pre-fetched books to avoid per-race API calls.
-    rank_non_arbs : bool
-        If True, re-solve with force_deploy when no arb found (slower).
+        Race identifier for display.
     """
-    if market_meta is None:
-        market_meta = {}
+    # Only consider single-runner market types (not FORECAST etc.)
+    bets = [b for b in runner_bets if b.market_type in SINGLE_RUNNER_TYPES]
 
-    # Determine scenario depth from the markets present
-    max_depth = 1
-    market_types_present: set[str] = set()
-
-    for cat in race_catalogues:
-        meta = market_meta.get(cat.market_id, {})
-        mt = meta.get("market_type", WIN)
-        market_types_present.add(mt)
-
-        if mt in (PLACE, OTHER_PLACE):
-            pc = meta.get("place_count", 0)
-            if pc > max_depth:
-                max_depth = pc
-        elif mt == EACH_WAY:
-            ewp = meta.get("ew_places", 0)
-            if ewp > max_depth:
-                max_depth = ewp
-        elif mt in (FORECAST, REVERSE_FORECAST, REV_FORECAST):
-            max_depth = max(max_depth, 2)
-
-    # Build runner list and extract bets
-    runners = runner_names(race_catalogues)
-    bets = extract_bet_options(
-        session, race_catalogues, price_depth=2, market_meta=market_meta,
-        pre_fetched_books=pre_fetched_books,
-    )
-
-    if not bets:
+    if len(bets) < 2:
         return ArbResult(
-            status="no_prices", guaranteed_profit=0, total_stake=0,
-            stakes=[], bets=[], profit_by_scenario=np.array([]),
-            scenario_labels=[], race_name=race_name,
+            status="insufficient_bets",
+            guaranteed_profit=0.0,
+            total_stake=0.0,
+            stakes=[0.0] * len(bets),
+            bets=bets,
+            profit_by_scenario=np.array([]),
+            scenario_labels=[],
+            race_name=f"{race_name} – {runner_name}",
         )
 
-    # Check scenario count isn't too large
-    n = len(runners)
-    n_scenarios_est = perm(n, min(max_depth, n))
-    if n_scenarios_est > 50000:
-        logger.warning(
-            f"Skipping {race_name}: {n_scenarios_est} scenarios too large "
-            f"({n} runners, depth={max_depth})"
-        )
+    # Only worth checking if bets span ≥ 2 distinct market types
+    market_types = {b.market_type for b in bets}
+    if len(market_types) < 2:
         return ArbResult(
-            status="too_many_scenarios", guaranteed_profit=0, total_stake=0,
-            stakes=[], bets=[], profit_by_scenario=np.array([]),
-            scenario_labels=[], race_name=race_name,
+            status="single_market",
+            guaranteed_profit=0.0,
+            total_stake=0.0,
+            stakes=[0.0] * len(bets),
+            bets=bets,
+            profit_by_scenario=np.array([]),
+            scenario_labels=[],
+            race_name=f"{race_name} – {runner_name}",
         )
 
-    labels, scenarios = build_scenarios(runners, max_places=max_depth)
-    A = build_payout_matrix(bets, scenarios)
+    # Determine outcome states (3–5 typically)
+    states = _runner_outcome_states(bets)
+    positions = [s[0] for s in states]
+    labels = [s[1] for s in states]
 
-    mkt_summary = ", ".join(sorted(market_types_present))
-    logger.info(
-        f"Scanning {race_name} | "
-        f"markets=[{mkt_summary}], "
-        f"depth={max_depth}, runners={n}, "
-        f"scenarios={len(scenarios)}, bets={len(bets)}"
-    )
-
+    # Build tiny payout matrix and solve
+    A = _build_runner_payout_matrix(bets, positions)
     result = solve_arb(
         bets=bets,
         payout_matrix=A,
@@ -131,68 +232,118 @@ def scan_arb(
         scenario_labels=labels,
     )
 
+    result.race_name = f"{race_name} – {runner_name}"
+    result.n_scenarios = len(states)
     if result.is_arb:
         result.arb_margin = result.guaranteed_profit / budget
-    elif rank_non_arbs:
-        # Re-solve with forced stake deployment for arb margin ranking
-        forced = solve_arb(
-            bets=bets,
-            payout_matrix=A,
-            budget=budget,
-            commission=commission,
-            scenario_labels=labels,
-            force_deploy=True,
-        )
-        if forced.status in ("optimal", "optimal_inaccurate"):
-            result = forced
-            total_staked = max(forced.total_stake, 1e-9)
-            result.arb_margin = forced.guaranteed_profit / total_staked
-        else:
-            result.arb_margin = -1.0
     else:
         result.arb_margin = -1.0
 
-    result.race_name = race_name
-    result.n_scenarios = len(scenarios)
     return result
 
 
+# ── Race-level scan ───────────────────────────────────────────────────────────
+
+def scan_race(
+    session,
+    race_catalogues: list,
+    budget: float = 100.0,
+    commission: float = 0.02,
+    market_meta: Optional[dict[str, dict]] = None,
+    race_name: str = "",
+    n_runners: int = 0,
+    pre_fetched_books: Optional[dict] = None,
+) -> list[ArbResult]:
+    """
+    Scan every runner in a race for cross-market arbs.
+
+    Returns a list of ArbResult — one per runner with an arb found.
+    Empty list if no arbs in this race.
+    """
+    if market_meta is None:
+        market_meta = {}
+
+    bets = extract_bet_options(
+        session, race_catalogues, price_depth=2,
+        market_meta=market_meta,
+        pre_fetched_books=pre_fetched_books,
+    )
+
+    if not bets:
+        return []
+
+    # Group bets by runner
+    runner_bets: dict[str, list[BetOption]] = {}
+    for b in bets:
+        if b.market_type in SINGLE_RUNNER_TYPES:
+            runner_bets.setdefault(b.runner_name, []).append(b)
+
+    results: list[ArbResult] = []
+    for rname, rbets in runner_bets.items():
+        # Need bets across ≥ 2 market types for cross-market arb
+        if len({b.market_type for b in rbets}) < 2:
+            continue
+
+        result = scan_runner_arb(
+            runner_name=rname,
+            runner_bets=rbets,
+            budget=budget,
+            commission=commission,
+            race_name=race_name,
+        )
+
+        if result.is_arb:
+            results.append(result)
+
+    return results
+
+
+# ── Batch scan ────────────────────────────────────────────────────────────────
+
 def scan_all_arbs(
     session,
-    days: int = 1,
+    days: int = 0,
+    hours: float = 0,
     countries: Optional[list[str]] = None,
     budget: float = 100.0,
     commission: float = 0.02,
     min_profit: float = 0.01,
-    return_all: bool = False,
     market_types: Optional[list[str]] = None,
-    rank_non_arbs: bool = False,
+    verbose: bool = False,
+    **kwargs,
 ) -> list[ArbResult]:
     """
-    Scan all UK/IE races across ALL available market types.
-
-    Fetches markets, groups by race (event_id + start_time), fetches ALL
-    price books in one batch, then solves for arbs.
-
-    Returns only results with guaranteed_profit > min_profit,
-    unless return_all=True.
+    Scan all races for cross-market per-runner arbs.
 
     Parameters
     ----------
-    rank_non_arbs : bool
-        If True, re-solve non-arb races with force_deploy for ranking.
-        Default False (much faster).
+    verbose : bool
+        If True, log detailed progress (DEBUG-level info).
+        If False (default), only log arb finds, warnings, and errors.
+
+    Returns only ArbResult objects with guaranteed_profit ≥ min_profit.
     """
+    # Set log level for this scan
+    prev_level = logger.level
+    scan_level = logging.DEBUG if verbose else logging.WARNING
+    logger.setLevel(scan_level)
+
+    # Also control betfairtools logging noise
+    _bt_logger = logging.getLogger("betfairtools")
+    _bt_prev = _bt_logger.level
+    _bt_logger.setLevel(scan_level)
+
     countries = countries or ["GB", "IE"]
-    market_types = market_types or ALL_RACING_TYPES
+    market_types = market_types or SCAN_MARKET_TYPES
+
+    if not days and not hours:
+        days = 1  # default to 1 day
 
     # ── Fetch catalogues ──────────────────────────────────────────────────
-    # Try fetching all market types at once; fall back to per-type if API
-    # returns TOO_MUCH_DATA.
     all_markets: list = []
     try:
         all_markets = session.racing.markets(
-            days=days, countries=countries,
+            days=days, hours=hours, countries=countries,
             market_type_codes=market_types,
         )
     except Exception:
@@ -200,7 +351,7 @@ def scan_all_arbs(
         for mt_code in market_types:
             try:
                 batch = session.racing.markets(
-                    days=days, countries=countries,
+                    days=days, hours=hours, countries=countries,
                     market_type_codes=[mt_code],
                 )
                 all_markets.extend(batch)
@@ -209,7 +360,7 @@ def scan_all_arbs(
 
     logger.info(f"Fetched {len(all_markets)} total racing markets")
 
-    # Group all markets by race: (event_id, market_start_time)
+    # Group by race (event_id + start_time)
     race_groups: dict[tuple[str, str], list] = {}
     for cat in all_markets:
         eid = cat.event.id if cat.event else None
@@ -222,7 +373,7 @@ def scan_all_arbs(
 
     logger.info(f"Grouped into {len(race_groups)} distinct races")
 
-    # Count market types across all races
+    # Count market types
     type_counts: dict[str, int] = {}
     for cats in race_groups.values():
         for cat in cats:
@@ -236,9 +387,9 @@ def scan_all_arbs(
 
     # ── Batch-fetch ALL price books upfront ───────────────────────────────
     all_market_ids = [cat.market_id for cats in race_groups.values() for cat in cats]
-    logger.info(f"Fetching price books for {len(all_market_ids)} markets in batch")
+    logger.info(f"Fetching price books for {len(all_market_ids)} markets")
     all_book_list: list = []
-    CHUNK = 10  # Betfair TOO_MUCH_DATA at 40 with EX_BEST_OFFERS+EX_TRADED
+    CHUNK = 10
     for i in range(0, len(all_market_ids), CHUNK):
         chunk = all_market_ids[i : i + CHUNK]
         try:
@@ -248,11 +399,12 @@ def scan_all_arbs(
     pre_fetched_books: dict = {b.market_id: b for b in all_book_list}
     logger.info(f"Fetched {len(pre_fetched_books)} books")
 
+    # ── Scan each race ────────────────────────────────────────────────────
     all_results: list[ArbResult] = []
-    arb_results: list[ArbResult] = []
+    total_runners = 0
 
     for (eid, start_iso), cats in race_groups.items():
-        # Find the WIN catalogue for race name and runner count
+        # Find WIN catalogue for race name
         win_cat = None
         for c in cats:
             desc = getattr(c, "description", None)
@@ -262,7 +414,6 @@ def scan_all_arbs(
             if classified == WIN:
                 win_cat = c
                 break
-
         if not win_cat:
             win_cat = cats[0]
 
@@ -274,6 +425,7 @@ def scan_all_arbs(
         )
         race_label = f"{course} {start_time_str} – {race_desc}"
         n_runners = len(win_cat.runners) if win_cat.runners else 0
+        total_runners += n_runners
 
         # Build per-market metadata
         meta: dict[str, dict] = {}
@@ -285,7 +437,6 @@ def scan_all_arbs(
             mt = classify_market_type(mname, mt_code)
 
             m: dict = {"market_type": mt}
-
             if mt in (PLACE, OTHER_PLACE):
                 pc = detect_place_count(
                     desc, market_name=mname, n_runners=n_runners
@@ -295,48 +446,42 @@ def scan_all_arbs(
                 frac, places = detect_ew_terms(desc, n_runners=n_runners)
                 m["ew_fraction"] = frac
                 m["ew_places"] = places
-                logger.info(
-                    f"EW terms for {mname}: fraction=1/{int(1/frac) if frac else '?'} "
-                    f"({frac:.4f}), places={places}"
-                )
 
             meta[cat.market_id] = m
 
         try:
-            res = scan_arb(
+            race_arbs = scan_race(
                 session, cats,
                 budget=budget, commission=commission,
                 market_meta=meta,
                 race_name=race_label,
                 n_runners=n_runners,
                 pre_fetched_books=pre_fetched_books,
-                rank_non_arbs=rank_non_arbs,
             )
-            all_results.append(res)
-            if res.is_arb and res.guaranteed_profit >= min_profit:
-                mkt_types = ", ".join(sorted(set(
-                    m.get("market_type", "?") for m in meta.values()
-                )))
+
+            for r in race_arbs:
+                if r.guaranteed_profit >= min_profit:
+                    logger.info(
+                        f"ARB FOUND: {r.race_name} | "
+                        f"profit=£{r.guaranteed_profit:.4f}"
+                    )
+                    all_results.append(r)
+
+            if not race_arbs:
                 logger.info(
-                    f"ARB FOUND: {race_label} | "
-                    f"profit=£{res.guaranteed_profit:.4f} | "
-                    f"markets=[{mkt_types}]"
-                )
-                arb_results.append(res)
-            else:
-                logger.info(
-                    f"No arb: {race_label} | "
-                    f"margin={res.arb_margin:+.4%} | "
-                    f"markets={len(cats)} | "
-                    f"scenarios={res.n_scenarios}"
+                    f"No arbs: {race_label} "
+                    f"({n_runners} runners, {len(cats)} markets)"
                 )
         except Exception as e:
             logger.warning(f"Error scanning {race_label}: {e}")
 
     logger.info(
-        f"Racing arb scan complete: "
-        f"{len(arb_results)}/{len(all_results)} races have arbs"
+        f"Scan complete: {len(all_results)} arbs "
+        f"across {len(race_groups)} races, {total_runners} runners"
     )
-    if return_all:
-        return all_results
-    return arb_results
+
+    # Restore previous log levels
+    logger.setLevel(prev_level)
+    _bt_logger.setLevel(_bt_prev)
+
+    return all_results
