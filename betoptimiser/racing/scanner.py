@@ -37,6 +37,8 @@ def scan_arb(
     market_meta: Optional[dict[str, dict]] = None,
     race_name: str = "",
     n_runners: int = 0,
+    pre_fetched_books: Optional[dict] = None,
+    rank_non_arbs: bool = False,
 ) -> ArbResult:
     """
     End‑to‑end arb scan for a single horse race across ALL available
@@ -54,6 +56,10 @@ def scan_arb(
         Per-market metadata (market_type, place_count, ew_fraction, ew_places).
     race_name : str
     n_runners : int
+    pre_fetched_books : dict[market_id, MarketBook] | None
+        Pre-fetched books to avoid per-race API calls.
+    rank_non_arbs : bool
+        If True, re-solve with force_deploy when no arb found (slower).
     """
     if market_meta is None:
         market_meta = {}
@@ -81,7 +87,8 @@ def scan_arb(
     # Build runner list and extract bets
     runners = runner_names(race_catalogues)
     bets = extract_bet_options(
-        session, race_catalogues, price_depth=2, market_meta=market_meta
+        session, race_catalogues, price_depth=2, market_meta=market_meta,
+        pre_fetched_books=pre_fetched_books,
     )
 
     if not bets:
@@ -126,7 +133,7 @@ def scan_arb(
 
     if result.is_arb:
         result.arb_margin = result.guaranteed_profit / budget
-    else:
+    elif rank_non_arbs:
         # Re-solve with forced stake deployment for arb margin ranking
         forced = solve_arb(
             bets=bets,
@@ -142,6 +149,8 @@ def scan_arb(
             result.arb_margin = forced.guaranteed_profit / total_staked
         else:
             result.arb_margin = -1.0
+    else:
+        result.arb_margin = -1.0
 
     result.race_name = race_name
     result.n_scenarios = len(scenarios)
@@ -157,30 +166,46 @@ def scan_all_arbs(
     min_profit: float = 0.01,
     return_all: bool = False,
     market_types: Optional[list[str]] = None,
+    rank_non_arbs: bool = False,
 ) -> list[ArbResult]:
     """
     Scan all UK/IE races across ALL available market types.
 
-    Fetches markets, groups by race (event_id + start_time), solves
-    for arbs across all correlated markets simultaneously.
+    Fetches markets, groups by race (event_id + start_time), fetches ALL
+    price books in one batch, then solves for arbs.
 
     Returns only results with guaranteed_profit > min_profit,
     unless return_all=True.
+
+    Parameters
+    ----------
+    rank_non_arbs : bool
+        If True, re-solve non-arb races with force_deploy for ranking.
+        Default False (much faster).
     """
     countries = countries or ["GB", "IE"]
     market_types = market_types or ALL_RACING_TYPES
 
-    # Fetch market types in batches to avoid TOO_MUCH_DATA API errors
+    # ── Fetch catalogues ──────────────────────────────────────────────────
+    # Try fetching all market types at once; fall back to per-type if API
+    # returns TOO_MUCH_DATA.
     all_markets: list = []
-    for mt_code in market_types:
-        try:
-            batch = session.racing.markets(
-                days=days, countries=countries,
-                market_type_codes=[mt_code],
-            )
-            all_markets.extend(batch)
-        except Exception as e:
-            logger.warning(f"Could not fetch {mt_code} markets: {e}")
+    try:
+        all_markets = session.racing.markets(
+            days=days, countries=countries,
+            market_type_codes=market_types,
+        )
+    except Exception:
+        logger.info("Bulk catalogue fetch failed, falling back to per-type")
+        for mt_code in market_types:
+            try:
+                batch = session.racing.markets(
+                    days=days, countries=countries,
+                    market_type_codes=[mt_code],
+                )
+                all_markets.extend(batch)
+            except Exception as e:
+                logger.warning(f"Could not fetch {mt_code} markets: {e}")
 
     logger.info(f"Fetched {len(all_markets)} total racing markets")
 
@@ -208,6 +233,20 @@ def scan_all_arbs(
             _type = classify_market_type(mname, mt_code)
             type_counts[_type] = type_counts.get(_type, 0) + 1
     logger.info(f"Market type breakdown: {type_counts}")
+
+    # ── Batch-fetch ALL price books upfront ───────────────────────────────
+    all_market_ids = [cat.market_id for cats in race_groups.values() for cat in cats]
+    logger.info(f"Fetching price books for {len(all_market_ids)} markets in batch")
+    all_book_list: list = []
+    CHUNK = 10  # Betfair TOO_MUCH_DATA at 40 with EX_BEST_OFFERS+EX_TRADED
+    for i in range(0, len(all_market_ids), CHUNK):
+        chunk = all_market_ids[i : i + CHUNK]
+        try:
+            all_book_list.extend(session.book(chunk, price_depth=2))
+        except Exception as e:
+            logger.warning(f"Book fetch error for chunk {i}: {e}")
+    pre_fetched_books: dict = {b.market_id: b for b in all_book_list}
+    logger.info(f"Fetched {len(pre_fetched_books)} books")
 
     all_results: list[ArbResult] = []
     arb_results: list[ArbResult] = []
@@ -270,6 +309,8 @@ def scan_all_arbs(
                 market_meta=meta,
                 race_name=race_label,
                 n_runners=n_runners,
+                pre_fetched_books=pre_fetched_books,
+                rank_non_arbs=rank_non_arbs,
             )
             all_results.append(res)
             if res.is_arb and res.guaranteed_profit >= min_profit:

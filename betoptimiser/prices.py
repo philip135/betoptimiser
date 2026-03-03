@@ -21,15 +21,16 @@ def extract_bet_options(
     market_catalogues: list,
     price_depth: int = 1,
     market_meta: Optional[dict[str, dict]] = None,
+    pre_fetched_books: Optional[dict] = None,
 ) -> list[BetOption]:
     """
-    Pull live prices for a list of market catalogues and return BetOption
-    objects for every back and lay at the top of book.
+    Build BetOption objects from live prices.
 
     Parameters
     ----------
     session : betfairtools.Session
         Authenticated session (or anything with a .book() method).
+        Ignored if *pre_fetched_books* is provided.
     market_catalogues : list
         MarketCatalogue objects.
     price_depth : int
@@ -38,14 +39,19 @@ def extract_bet_options(
         Per-market metadata with keys:
           market_type, place_count, ew_fraction, ew_places
         If None, market_type is inferred from market_name heuristics.
+    pre_fetched_books : dict[market_id, MarketBook] | None
+        If supplied, uses these instead of calling the API.
     """
     market_ids = [m.market_id for m in market_catalogues]
 
-    # Betfair allows max 40 market IDs per request
-    all_books = []
-    for i in range(0, len(market_ids), 40):
-        chunk = market_ids[i : i + 40]
-        all_books.extend(session.book(chunk, price_depth=price_depth))
+    if pre_fetched_books is not None:
+        all_books = [pre_fetched_books[mid] for mid in market_ids if mid in pre_fetched_books]
+    else:
+        # Betfair allows max 40 market IDs per request
+        all_books = []
+        for i in range(0, len(market_ids), 40):
+            chunk = market_ids[i : i + 40]
+            all_books.extend(session.book(chunk, price_depth=price_depth))
 
     # Build name lookups
     name_map: dict[str, dict[int, str]] = {}
