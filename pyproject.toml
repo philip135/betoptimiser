@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "betoptimiser"
+version = "0.1.0"
+description = "Betting markets optimisation library – find guaranteed-profit portfolios via convex optimisation"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "philip135"},
+]
+keywords = ["betting", "arbitrage", "optimisation", "horse-racing", "football", "cvxpy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "betfairtools>=0.1.0",
+    "cvxpy>=1.4.0",
+    "numpy>=1.24.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/philip135/betoptimiser"
+Repository = "https://github.com/philip135/betoptimiser"
+Issues = "https://github.com/philip135/betoptimiser/issues"
+
+[tool.setuptools.packages.find]
+include = ["betoptimiser*"]
